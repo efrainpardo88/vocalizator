@@ -17,7 +17,12 @@ concurrency:
 
 jobs:
   claude:
-    if: contains(github.event.comment.body, '@claude')
+    # The repository is public, so anyone can comment. The action rejects a
+    # commenter without write access on its own, but this keeps a stranger
+    # from starting a runner at all.
+    if: >-
+      contains(github.event.comment.body, '@claude') &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
