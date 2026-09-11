@@ -40,13 +40,20 @@ pattern library is more valuable here than a prettier interface.
 
 ```bash
 npm install
-npm run dev      # http://localhost:5173
-npm run build    # type-free build into dist/
-npm run preview  # serve the built output
+npm run dev        # http://localhost:5173
+npm run build      # type-free build into dist/
+npm run preview    # serve the built output
+npm test           # Vitest, one run
+npm run test:watch # Vitest, re-running as you edit
 ```
 
-There is no test suite and no linter configured. `npm run build` is the only automated
-check that exists — run it before reporting any code change as done.
+There is no linter configured. `npm test` and `npm run build` are the automated checks
+that exist — run both before reporting any code change as done.
+
+The tests cover the pure modules only: `pitch.js` and `patterns.js`. Nothing exercises
+the component or Tone.js, so anything touching audio, scheduling or the microphone is
+still verified by ear on a real device. The iOS silence bug passed the build untouched;
+assume the same of any audio regression.
 
 ## Layout
 
@@ -56,6 +63,8 @@ src/main.jsx            entry point
 src/VocalLines.jsx      the component: state, scheduler, tuner, UI
 src/patterns.js         PATTERN_LIBRARY, VOICE_TYPES, PLAYBACK_MODES, toSteps, countBeats
 src/pitch.js            note math, formatting, autocorrelation pitch detection
+src/patterns.test.js    library invariants, toSteps, countBeats, option lists
+src/pitch.test.js       note math, formatDuration, detectPitch against synthetic sines
 src/styles.css          stylesheet, CSS custom properties at :root
 ```
 
@@ -84,7 +93,9 @@ which is the worst kind of regression to catch.
 
 **`beats` is parallel to `degrees`.** A pattern with mismatched array lengths does not
 throw; `toSteps` silently falls back to one beat for the missing entries and the exercise
-plays wrong. When adding or editing a pattern with sustains, count both arrays.
+plays wrong. When adding or editing a pattern with sustains, count both arrays. A test in
+`patterns.test.js` now enforces this and names the offending pattern, so run `npm test`
+after touching the library.
 
 **New patterns go in `PATTERN_LIBRARY`, never inline in the component.**
 `PATTERN_CATEGORIES` is derived from the array, so a new `category` value appears in the

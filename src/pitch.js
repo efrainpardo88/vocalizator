@@ -77,9 +77,13 @@ export function detectPitch(buffer, sampleRate) {
   return frequency;
 }
 
-/** Formats seconds as m:ss. */
+/**
+ * Formats seconds as m:ss. Rounds before splitting, because rounding the
+ * remainder on its own turns 59.6 seconds into "0:60".
+ */
 export const formatDuration = (seconds) => {
-  const minutes = Math.floor(seconds / 60);
-  const remainder = Math.round(seconds % 60);
+  const wholeSeconds = Math.round(seconds);
+  const minutes = Math.floor(wholeSeconds / 60);
+  const remainder = wholeSeconds % 60;
   return `${minutes}:${String(remainder).padStart(2, '0')}`;
 };
