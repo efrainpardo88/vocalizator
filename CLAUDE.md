@@ -55,6 +55,24 @@ the component or Tone.js, so anything touching audio, scheduling or the micropho
 still verified by ear on a real device. The iOS silence bug passed the build untouched;
 assume the same of any audio regression.
 
+## How changes reach production
+
+`main` deploys to production on every push, through Vercel's git integration. Other
+branches get their own preview deployment, which is the only way to try a change on a
+phone before it is live — use it for anything touching audio.
+
+The Vercel build command is `npm test && npm run build`, so a failing test aborts the
+deployment and production stays on the last good version. This is the only enforced gate
+in the project: branch protection is unavailable on a free private repository, so a red
+check on a pull request blocks nothing by itself. Keep the build command's suite
+deterministic. Tests that need audio, a device or the network belong somewhere else, or a
+flaky one will hold a release hostage.
+
+`.github/workflows/ci.yml` runs the same two checks on pull requests, for a verdict that
+does not depend on the agent's own report of them. `.github/workflows/claude.yml` runs
+Claude on `@claude` in a comment, and only there: no push, issue or schedule trigger,
+because each run spends subscription quota.
+
 ## Layout
 
 ```

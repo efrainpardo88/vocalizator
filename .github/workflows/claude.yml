@@ -1,0 +1,41 @@
+name: Claude
+
+# Claude runs only when a human writes @claude in a comment. There is no
+# trigger on push, on opened issues or on a schedule: every run spends the
+# subscription quota, so every run is asked for explicitly.
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+# One run at a time. A burst of comments queues instead of multiplying into
+# parallel runs against the same quota.
+concurrency:
+  group: claude
+  cancel-in-progress: false
+
+jobs:
+  claude:
+    if: contains(github.event.comment.body, '@claude')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          # Subscription auth, not an API key: runs draw from the plan
+          # rather than billing per token. Generated with `claude setup-token`.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Caps how far a single run can go. Paired with timeout-minutes
+          # above, it bounds what one comment can cost.
+          claude_args: "--max-turns 60"
