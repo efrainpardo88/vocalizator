@@ -19,7 +19,7 @@ jobs:
 
       # Node 24 matches the version Vercel builds with, so a failure here
       # means a failure there.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
