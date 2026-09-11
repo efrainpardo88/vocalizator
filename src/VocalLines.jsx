@@ -31,6 +31,26 @@ const getTransport = () => (Tone.getTransport ? Tone.getTransport() : Tone.Trans
 const getDraw = () => (Tone.getDraw ? Tone.getDraw() : Tone.Draw);
 
 /**
+ * iOS Safari runs Web Audio in the "ambient" audio session, which the hardware
+ * ring/silent switch mutes. "playback" is the category for audio the user asked
+ * for and ignores that switch; "play-and-record" is the one iOS demands while a
+ * microphone stream is open. Set this from a user gesture, next to Tone.start()
+ * or the microphone toggle. Available from iOS 16.4, a no-op everywhere else.
+ *
+ * Verified on the deployed build: on iPhone with the microphone off nothing is
+ * audible, and turning the microphone on makes playback audible but very quiet,
+ * which is the documented behaviour of these two sessions. That the property
+ * below corrects it is assumed, not verified on a device.
+ */
+const setAudioSession = (type) => {
+  try {
+    if (navigator.audioSession) navigator.audioSession.type = type;
+  } catch (error) {
+    // Older WebKit exposes no settable audio session; the silent switch wins.
+  }
+};
+
+/**
  * Parses the custom pattern field.
  * Each token is a semitone offset, optionally followed by `xN` to hold the
  * note for N beats: `0 2 4 5 7x5 5 4 2 0`.
@@ -188,6 +208,7 @@ export default function VocalLines() {
   }, []);
 
   const play = useCallback(async () => {
+    setAudioSession(microphoneOn ? 'play-and-record' : 'playback');
     await Tone.start(); // Browsers only allow audio after a user gesture.
 
     const transport = getTransport();
@@ -259,7 +280,7 @@ export default function VocalLines() {
 
     transport.start();
     setPlayState('playing');
-  }, [steps, roots, beatDuration, playbackMode, restBeats, tempo, stop]);
+  }, [steps, roots, beatDuration, playbackMode, restBeats, tempo, stop, microphoneOn]);
 
   const pause = () => {
     getTransport().pause();
@@ -291,12 +312,14 @@ export default function VocalLines() {
   const toggleMicrophone = async () => {
     if (microphoneOn) {
       closeMicrophone();
+      setAudioSession('playback');
       setMicrophoneOn(false);
       setDetectedPitch(null);
       return;
     }
 
     setMicrophoneError('');
+    setAudioSession('play-and-record');
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
