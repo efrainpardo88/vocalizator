@@ -8,8 +8,11 @@ Vocal Lines is a single-page vocal practice tool. The user picks an exercise pat
 vocal range; the app plays the pattern, transposes it by a fixed interval on every pass,
 and optionally listens through the microphone to show how far off pitch the singer is.
 
-Vite + React 18 + Tone.js. No backend, no API, no environment variables, no build step
-beyond `vite build`.
+Vite + React 18 + Tone.js on the client, playing and listening entirely in the browser.
+The next phase adds accounts, cloud sync and scoring, which need a backend; the specific
+architecture — hosting, API shape, database — is an open decision tracked in issue #4, not
+decided by this document. Until #4 lands, treat backend specifics as undecided rather than
+assumed, and do not guess at them.
 
 ## The brief it was built against
 
@@ -35,6 +38,13 @@ makes it easier to sing along without being accurate is working against the poin
 Two things follow from this that are easy to get backwards. Features that add polish but
 remove repetition or remove the singer's exposure are a downgrade. And a bigger, stranger
 pattern library is more valuable here than a prettier interface.
+
+**None of this is superseded by accounts, cloud sync or scoring.** Those are additions on
+top of the practice loop, not a replacement for it. "Tapping Start has to be enough" still
+holds: a sign-in step, a saved study plan or a synced score must never be a precondition
+for running an exercise. "Volume of repetition is the feature" still holds too: a login
+flow that gets between the singer and Start, or a sync step that eats into how many
+repeats happen in a session, is a downgrade no matter what it adds elsewhere.
 
 ## Commands
 
@@ -134,12 +144,20 @@ loops for note timing; they drift against the audio clock.
 as getters in v15 and as properties in v14. Calling `Tone.Transport` directly breaks on one
 of the two.
 
-**Audio never leaves the device.** Microphone input is analyzed locally and discarded.
-Do not add analytics, telemetry, error reporting, or any network call. The app works
-offline by design.
+**Raw audio never leaves the device; derived numbers may.** The microphone buffer is
+analyzed locally and discarded — this is a privacy promise made to the singer, not an
+accident of an offline-only architecture, so do not delete it once a backend exists. What
+that promise permits to travel over the network is *derived* data only: cents of
+deviation, a score, a pitch trace expressed as a list of numbers. It never permits the
+raw microphone signal or a recording of it. This is what makes accounts, cloud sync and
+scoring buildable without contradicting the privacy invariant: they carry numbers, never
+audio.
 
-**Keep the dependency list at three.** react, react-dom, tone. Ask before adding anything,
-including UI libraries, state managers, and audio helpers.
+**Dependencies are two separate lists.** The audio core keeps its three runtime
+dependencies — react, react-dom, tone — unchanged; ask before adding to that list, same as
+before. Whatever the backend needs (framework, database client, auth library, and so on)
+is a distinct, explicit list scoped to the architecture decision in issue #4. Do not fold
+one into the other, and do not add to either without asking.
 
 **`localStorage` is best effort.** Preference loading and saving are wrapped in try/catch
 and the app must work with storage disabled. Never make persistence load-bearing.
@@ -161,5 +179,14 @@ if you touch it.
 
 ## Out of scope
 
-No accounts, no cloud sync, no recording or playback of the user's voice, no song library,
-no MIDI export. If a request implies one of these, raise it before building.
+Accounts and cloud sync are no longer out of scope — sign-in, saved scores, study plans
+and public profiles are the direction, not a violation of it; see issue #4 for the
+architecture that will carry them.
+
+Recording or playback of the user's voice stays out, explicitly, and for a specific
+reason: it is what makes "raw audio never leaves the device" true. The moment a recording
+is kept instead of discarded after analysis, that invariant is gone, so this exclusion is
+load-bearing, not a leftover from the offline-only design.
+
+No song library, no MIDI export. If a request implies one of these two, raise it before
+building.
