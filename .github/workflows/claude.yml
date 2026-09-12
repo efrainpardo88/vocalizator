@@ -41,6 +41,14 @@ jobs:
           # Subscription auth, not an API key: runs draw from the plan
           # rather than billing per token. Generated with `claude setup-token`.
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # Caps how far a single run can go. Paired with timeout-minutes
-          # above, it bounds what one comment can cost.
-          claude_args: "--max-turns 60"
+          # --max-turns caps how far a single run can go. Paired with
+          # timeout-minutes above, it bounds what one comment can cost.
+          #
+          # Without --allowedTools the run has no shell at all: the first run
+          # could neither execute npm test nor open its own pull request, and
+          # said so. The list below is what a run needs to finish a task and
+          # check its own work. gh is scoped to pull requests and issues, so a
+          # run cannot reach repository administration.
+          claude_args: |
+            --max-turns 60
+            --allowedTools "Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(git:*),Bash(gh pr:*),Bash(gh issue:*)"
