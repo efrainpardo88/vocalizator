@@ -13,6 +13,7 @@ import {
 
 import {
   BLACK_KEY_CLASSES,
+  IN_TUNE_CENTS,
   centsBetween,
   detectPitch,
   formatDuration,
@@ -21,10 +22,32 @@ import {
   midiToFrequency,
 } from './pitch.js';
 
+import {
+  closestVoiceType,
+  finalizeRangeTest,
+  recordAttempt,
+  startRangeTest,
+} from './range.js';
+
 const KEYBOARD_LOWEST = 36;
 const KEYBOARD_HIGHEST = 84;
 const STORAGE_KEY = 'vocal-lines:preferences';
-const IN_TUNE_CENTS = 20;
+const RANGE_STORAGE_KEY = 'vocal-lines:range-result';
+
+/**
+ * C4: a broadly comfortable starting note for most voices to anchor the
+ * range test walk on. Assumed, not tuned against real singers yet.
+ */
+const RANGE_TEST_MIDDLE_MIDI = 60;
+const RANGE_TEST_TONE_SECONDS = 1.1;
+/** Lets the reference tone's release tail clear before checking for bleed. */
+const RANGE_TEST_SILENCE_GAP_SECONDS = 0.35;
+const RANGE_TEST_BLEED_CHECK_SECONDS = 0.3;
+/** A lingering tone this close to the target is read as the piano, not the singer. */
+const RANGE_TEST_BLEED_CENTS = 50;
+const RANGE_TEST_LISTEN_SECONDS = 2.2;
+/** Matches the practice tuner's polling interval. */
+const RANGE_TEST_SAMPLE_INTERVAL_MS = 90;
 
 /** Tone.js exposes these as getters in v15 and as properties in v14. */
 const getTransport = () => (Tone.getTransport ? Tone.getTransport() : Tone.Transport);
@@ -49,6 +72,21 @@ const setAudioSession = (type) => {
     // Older WebKit exposes no settable audio session; the silent switch wins.
   }
 };
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Picks a representative pitch from a listening window: the median of the
+ * settled second half, so the singer's reaction time at the start of the
+ * window doesn't skew the reading. Returns -1 when nothing was detected,
+ * the same "nothing usable" signal `detectPitch` itself returns.
+ */
+function pickSingerFrequency(readings) {
+  if (readings.length === 0) return -1;
+  const settled = readings.slice(Math.floor(readings.length / 2));
+  const sorted = [...settled].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
+}
 
 /**
  * Parses the custom pattern field.
@@ -104,8 +142,24 @@ export default function VocalLines() {
   const [microphoneError, setMicrophoneError] = useState('');
   const [detectedPitch, setDetectedPitch] = useState(null); // { midi, frequency }
 
+  // Vocal range test
+  const [rangeTestOpen, setRangeTestOpen] = useState(false);
+  const [rangeTestStage, setRangeTestStage] = useState('idle'); // idle | sounding | listening | analyzing | bleed-warning | stopped | incomplete | result
+  const [rangeTestState, setRangeTestState] = useState(null); // the range.js walk state
+  const [rangeTestResult, setRangeTestResult] = useState(null); // { lowestMidi, highestMidi, spanOctaves, voiceType }
+  const [rangeTestIncomplete, setRangeTestIncomplete] = useState(null); // 'down' | 'up' | 'both'
+  const [rangeTestError, setRangeTestError] = useState('');
+  const [rangeTestPianoWarning, setRangeTestPianoWarning] = useState(false);
+  const [savedRangeResult, setSavedRangeResult] = useState(null); // { lowestMidi, highestMidi, voiceType } from localStorage
+
   const synthRef = useRef(null);
   const microphoneRef = useRef(null);
+
+  const rangeMicRef = useRef(null);
+  const rangeSynthRef = useRef(null);
+  const rangeSessionIdRef = useRef(0);
+  const rangeRetryCarryOverRef = useRef(null); // the bound already established, while retrying the other direction
+  const pendingRetryRef = useRef(null); // { sessionId, run } — resumes after a piano-bleed warning
 
   /* ---------------------------- active pattern ---------------------------- */
   const customPattern = useMemo(() => parseCustomPattern(customInput), [customInput]);
@@ -398,6 +452,297 @@ export default function VocalLines() {
     return () => clearTimeout(timer);
   }, [lowestRoot, highestNote, tempo, patternId, useSolfege, customInput]);
 
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(RANGE_STORAGE_KEY);
+      if (!stored) return;
+      const saved = JSON.parse(stored);
+      if (typeof saved.lowestMidi !== 'number' || typeof saved.highestMidi !== 'number') return;
+      const voiceType = VOICE_TYPES.find((voice) => voice.id === saved.voiceTypeId) || null;
+      setSavedRangeResult({ lowestMidi: saved.lowestMidi, highestMidi: saved.highestMidi, voiceType });
+    } catch (error) {
+      // No storage available, or malformed data. No saved result to show.
+    }
+  }, []);
+
+  /* ------------------------------ range test ------------------------------ */
+  const closeRangeMicrophone = useCallback(() => {
+    try {
+      rangeMicRef.current?.stream?.getTracks().forEach((track) => track.stop());
+      rangeMicRef.current?.context?.close();
+    } catch (error) {
+      // Already closed.
+    }
+    rangeMicRef.current = null;
+  }, []);
+
+  useEffect(() => closeRangeMicrophone, [closeRangeMicrophone]);
+
+  useEffect(() => () => {
+    try {
+      rangeSynthRef.current?.dispose();
+    } catch (error) {
+      // Already gone.
+    }
+  }, []);
+
+  const openRangeMicrophone = async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+    const context = new (window.AudioContext || window.webkitAudioContext)();
+    const source = context.createMediaStreamSource(stream);
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser);
+    rangeMicRef.current = { stream, context, analyser };
+  };
+
+  /** Collects detected frequencies for `durationMs`, discarding unusable readings. */
+  const sampleRangeWindow = (durationMs) => new Promise((resolve) => {
+    const mic = rangeMicRef.current;
+    if (!mic) { resolve([]); return; }
+    const buffer = new Float32Array(mic.analyser.fftSize);
+    const readings = [];
+    const timer = setInterval(() => {
+      try {
+        mic.analyser.getFloatTimeDomainData(buffer);
+        const frequency = detectPitch(buffer, mic.context.sampleRate);
+        if (frequency > 0) readings.push(frequency);
+      } catch (error) {
+        // Stopping the test mid-window closes the stream from under this timer.
+      }
+    }, RANGE_TEST_SAMPLE_INTERVAL_MS);
+    setTimeout(() => {
+      clearInterval(timer);
+      resolve(readings);
+    }, durationMs);
+  });
+
+  const persistRangeResult = (result) => {
+    try {
+      localStorage.setItem(
+        RANGE_STORAGE_KEY,
+        JSON.stringify({ lowestMidi: result.lowestMidi, highestMidi: result.highestMidi, voiceTypeId: result.voiceType.id }),
+      );
+    } catch (error) {
+      // Storage disabled; the result simply is not remembered next time.
+    }
+    setSavedRangeResult({ lowestMidi: result.lowestMidi, highestMidi: result.highestMidi, voiceType: result.voiceType });
+  };
+
+  const applyMeasuredRange = (lowestMidi, highestMidi) => {
+    setLowestRoot(lowestMidi);
+    setHighestNote(highestMidi);
+  };
+
+  const closeRangeTestOverlay = () => {
+    setRangeTestOpen(false);
+    setRangeTestStage('idle');
+  };
+
+  /**
+   * Runs one target note end to end: sound it, let the reference tone's tail
+   * clear, confirm the microphone is no longer hearing the piano, then
+   * sample a window with (as far as this can tell) only the singer in it.
+   * Only that last window is ever handed to `recordAttempt` — never a window
+   * that overlaps the reference tone.
+   *
+   * Returns the next walk state, `'bleed'` if the piano was still audible
+   * (the caller should let the singer retry the same note), or `null` if the
+   * test was interrupted mid-step.
+   */
+  const measureOneNote = async (state, sessionId) => {
+    const targetMidi = state.nextTargetMidi;
+    setRangeTestStage('sounding');
+    rangeSynthRef.current.triggerAttackRelease(midiToFrequency(targetMidi), RANGE_TEST_TONE_SECONDS);
+
+    await wait((RANGE_TEST_TONE_SECONDS + RANGE_TEST_SILENCE_GAP_SECONDS) * 1000);
+    if (rangeSessionIdRef.current !== sessionId) return null;
+
+    const bleedReadings = await sampleRangeWindow(RANGE_TEST_BLEED_CHECK_SECONDS * 1000);
+    if (rangeSessionIdRef.current !== sessionId) return null;
+    const isBleeding = bleedReadings.some(
+      (frequency) => Math.abs(centsBetween(frequencyToMidi(frequency), targetMidi)) <= RANGE_TEST_BLEED_CENTS,
+    );
+    if (isBleeding) {
+      setRangeTestPianoWarning(true);
+      setRangeTestStage('bleed-warning');
+      return 'bleed';
+    }
+    setRangeTestPianoWarning(false);
+
+    setRangeTestStage('listening');
+    const readings = await sampleRangeWindow(RANGE_TEST_LISTEN_SECONDS * 1000);
+    if (rangeSessionIdRef.current !== sessionId) return null;
+
+    setRangeTestStage('analyzing');
+    return recordAttempt(state, pickSingerFrequency(readings));
+  };
+
+  const finishRangeTest = (finalState) => {
+    closeRangeMicrophone();
+    setAudioSession(microphoneOn ? 'play-and-record' : 'playback');
+
+    const result = finalizeRangeTest(finalState);
+    if (result) {
+      setRangeTestResult(result);
+      setRangeTestIncomplete(null);
+      setRangeTestStage('result');
+      persistRangeResult(result);
+      return;
+    }
+
+    // One or both boundaries were never established. Remember whichever was,
+    // so a directional retry can carry it forward instead of re-measuring it.
+    rangeRetryCarryOverRef.current = {
+      lowestMidi: finalState.lowestUsableMidi,
+      highestMidi: finalState.highestUsableMidi,
+    };
+    if (finalState.lowestUsableMidi === null && finalState.highestUsableMidi === null) {
+      setRangeTestIncomplete('both');
+    } else {
+      setRangeTestIncomplete(finalState.lowestUsableMidi === null ? 'down' : 'up');
+    }
+    setRangeTestStage('incomplete');
+  };
+
+  const runMainWalk = async (initialState, sessionId) => {
+    let state = initialState;
+    while (state.status !== 'complete') {
+      const result = await measureOneNote(state, sessionId);
+      if (rangeSessionIdRef.current !== sessionId || result === null) return;
+      if (result === 'bleed') {
+        pendingRetryRef.current = { sessionId, run: () => runMainWalk(state, sessionId) };
+        return;
+      }
+      state = result;
+      setRangeTestState(state);
+    }
+    finishRangeTest(state);
+  };
+
+  /** Re-walks only `direction`, carrying the other, already-established boundary forward. */
+  const runDirectionRetry = async (direction, initialState, sessionId) => {
+    let state = initialState;
+    const isResolved = () => (direction === 'down' ? state.phase === 'up' : state.status === 'complete');
+
+    while (!isResolved()) {
+      const result = await measureOneNote(state, sessionId);
+      if (rangeSessionIdRef.current !== sessionId || result === null) return;
+      if (result === 'bleed') {
+        pendingRetryRef.current = { sessionId, run: () => runDirectionRetry(direction, state, sessionId) };
+        return;
+      }
+      state = result;
+      setRangeTestState(state);
+    }
+
+    closeRangeMicrophone();
+    setAudioSession(microphoneOn ? 'play-and-record' : 'playback');
+
+    const carryOver = rangeRetryCarryOverRef.current || {};
+    const lowestMidi = direction === 'down' ? state.lowestUsableMidi : carryOver.lowestMidi;
+    const highestMidi = direction === 'up' ? state.highestUsableMidi : carryOver.highestMidi;
+
+    if (lowestMidi !== null && highestMidi !== null) {
+      const result = {
+        lowestMidi,
+        highestMidi,
+        spanOctaves: (highestMidi - lowestMidi) / 12,
+        voiceType: closestVoiceType(lowestMidi, highestMidi),
+      };
+      setRangeTestResult(result);
+      setRangeTestIncomplete(null);
+      setRangeTestStage('result');
+      persistRangeResult(result);
+    } else {
+      rangeRetryCarryOverRef.current = { lowestMidi, highestMidi };
+      setRangeTestIncomplete(lowestMidi === null ? 'down' : 'up');
+      setRangeTestStage('incomplete');
+    }
+  };
+
+  const retryAfterBleedWarning = () => {
+    const pending = pendingRetryRef.current;
+    if (!pending || rangeSessionIdRef.current !== pending.sessionId) return;
+    pendingRetryRef.current = null;
+    setRangeTestPianoWarning(false);
+    pending.run();
+  };
+
+  const startVocalRangeTest = async () => {
+    setRangeTestError('');
+    setRangeTestResult(null);
+    setRangeTestIncomplete(null);
+    setRangeTestPianoWarning(false);
+    pendingRetryRef.current = null;
+    rangeRetryCarryOverRef.current = null;
+
+    // Tone.start() must be the first await in this handler, not after the
+    // microphone permission prompt: iOS Safari only credits the click's user
+    // gesture to whatever runs before the gesture's window lapses, and an
+    // awaited permission dialog can outlast it.
+    setAudioSession('play-and-record');
+    await Tone.start();
+
+    if (!rangeSynthRef.current) {
+      rangeSynthRef.current = new Tone.Synth({
+        oscillator: { type: 'sine' },
+        envelope: { attack: 0.01, decay: 0.08, sustain: 0.7, release: 0.12 },
+      }).toDestination();
+    }
+
+    try {
+      await openRangeMicrophone();
+    } catch (error) {
+      setRangeTestError('Could not open the microphone. Check the browser permissions.');
+      return;
+    }
+
+    const sessionId = rangeSessionIdRef.current + 1;
+    rangeSessionIdRef.current = sessionId;
+
+    const initialState = startRangeTest(RANGE_TEST_MIDDLE_MIDI);
+    setRangeTestState(initialState);
+    setRangeTestStage('sounding');
+    setRangeTestOpen(true);
+    runMainWalk(initialState, sessionId);
+  };
+
+  const retryRangeDirection = async (direction) => {
+    setRangeTestError('');
+    pendingRetryRef.current = null;
+
+    // See startVocalRangeTest: Tone.start() goes first, before the microphone prompt.
+    setAudioSession('play-and-record');
+    await Tone.start();
+
+    try {
+      await openRangeMicrophone();
+    } catch (error) {
+      setRangeTestError('Could not open the microphone. Check the browser permissions.');
+      return;
+    }
+
+    const sessionId = rangeSessionIdRef.current + 1;
+    rangeSessionIdRef.current = sessionId;
+
+    const state = startRangeTest(RANGE_TEST_MIDDLE_MIDI, direction);
+    setRangeTestState(state);
+    setRangeTestStage('sounding');
+    runDirectionRetry(direction, state, sessionId);
+  };
+
+  const stopRangeTest = () => {
+    rangeSessionIdRef.current += 1; // invalidates any step still in flight
+    pendingRetryRef.current = null;
+    closeRangeMicrophone();
+    setAudioSession(microphoneOn ? 'play-and-record' : 'playback');
+    setRangeTestPianoWarning(false);
+    setRangeTestStage('stopped');
+  };
+
   /* ------------------------------ derived UI ----------------------------- */
   const activeRoot = cursor ? cursor.root : roots[0];
   const activeNotes = steps.map((step) => activeRoot + step.degree);
@@ -646,6 +991,42 @@ export default function VocalLines() {
           </section>
 
           <section className="panel">
+            <h2 className="panel-title">Find your range</h2>
+
+            <p className="hint" style={{ marginTop: 0 }}>
+              A guided, two-minute test: match a note, then follow the piano down and back up
+              until it reaches where your voice runs out. No music reading needed — the piano
+              tells you when it&rsquo;s your turn.
+            </p>
+
+            {savedRangeResult && (
+              <div className="meta-row">
+                <span>Last measured</span>
+                <b>
+                  {formatNote(savedRangeResult.lowestMidi, useSolfege)}–{formatNote(savedRangeResult.highestMidi, useSolfege)}
+                  {savedRangeResult.voiceType ? ` · ${savedRangeResult.voiceType.name}` : ''}
+                </b>
+              </div>
+            )}
+
+            <div className="transport" style={{ marginTop: 12 }}>
+              <button className="button" onClick={startVocalRangeTest}>
+                {savedRangeResult ? 'Measure again' : 'Find my vocal range'}
+              </button>
+              {savedRangeResult && (
+                <button
+                  className="button is-secondary"
+                  onClick={() => applyMeasuredRange(savedRangeResult.lowestMidi, savedRangeResult.highestMidi)}
+                >
+                  Apply last result
+                </button>
+              )}
+            </div>
+
+            {rangeTestError && <p className="error">{rangeTestError}</p>}
+          </section>
+
+          <section className="panel">
             <h2 className="panel-title">Playback</h2>
 
             <div className="chips">
@@ -759,6 +1140,134 @@ export default function VocalLines() {
           Start comfortable and climb slowly. A note that asks for force is the signal to stop the session and
           come back down, not to push through.
         </p>
+
+        {rangeTestOpen && (
+          <div className="range-test-overlay" role="dialog" aria-modal="true" aria-label="Vocal range test">
+            <div className="range-test-card">
+              <button className="range-test-close" onClick={stopRangeTest} aria-label="Stop the test">×</button>
+
+              {(rangeTestStage === 'sounding'
+                || rangeTestStage === 'listening'
+                || rangeTestStage === 'analyzing'
+                || rangeTestStage === 'bleed-warning') && (
+                <div aria-live="polite">
+                  <div
+                    className={`range-test-indicator ${
+                      rangeTestStage === 'listening'
+                        ? 'is-your-turn'
+                        : rangeTestStage === 'bleed-warning'
+                          ? 'is-warning'
+                          : 'is-piano'
+                    }`}
+                  >
+                    {rangeTestStage === 'sounding' && 'Listen…'}
+                    {rangeTestStage === 'listening' && 'Now you'}
+                    {rangeTestStage === 'analyzing' && 'Checking…'}
+                    {rangeTestStage === 'bleed-warning' && 'Still hearing the piano'}
+                  </div>
+
+                  <p className="hint">
+                    {rangeTestStage === 'sounding' && 'A note is about to play. Match it once it stops.'}
+                    {rangeTestStage === 'listening' && 'Sing "ah" on the note you just heard, and hold it.'}
+                    {rangeTestStage === 'analyzing' && 'One moment.'}
+                    {rangeTestStage === 'bleed-warning'
+                      && 'The microphone can still hear the piano. Turn its volume down or switch to headphones, then try again.'}
+                  </p>
+
+                  {rangeTestStage === 'bleed-warning' && (
+                    <div className="transport" style={{ justifyContent: 'center' }}>
+                      <button className="button" onClick={retryAfterBleedWarning}>Try this note again</button>
+                    </div>
+                  )}
+
+                  <p className="hint" style={{ marginTop: 16 }}>
+                    {rangeTestState?.phase === 'down' ? 'Walking down' : 'Walking up'} from the middle note.
+                  </p>
+                </div>
+              )}
+
+              {rangeTestStage === 'stopped' && (() => {
+                const lowestMidi = rangeTestState?.lowestUsableMidi ?? null;
+                const highestMidi = rangeTestState?.highestUsableMidi ?? null;
+                const hasAny = lowestMidi !== null || highestMidi !== null;
+                return (
+                  <>
+                    <p className="hint" style={{ marginTop: 0 }}>Test stopped.</p>
+                    {hasAny ? (
+                      <p>
+                        So far: {lowestMidi !== null ? formatNote(lowestMidi, useSolfege) : 'not yet found'}
+                        {' – '}
+                        {highestMidi !== null ? formatNote(highestMidi, useSolfege) : 'not yet found'}
+                      </p>
+                    ) : (
+                      <p className="hint">Nothing was measured yet.</p>
+                    )}
+                    <div className="transport" style={{ justifyContent: 'center' }}>
+                      {hasAny && (
+                        <button
+                          className="button"
+                          onClick={() => {
+                            if (lowestMidi !== null) setLowestRoot(lowestMidi);
+                            if (highestMidi !== null) setHighestNote(highestMidi);
+                            closeRangeTestOverlay();
+                          }}
+                        >
+                          Apply what we found
+                        </button>
+                      )}
+                      <button className="button is-secondary" onClick={closeRangeTestOverlay}>Close</button>
+                    </div>
+                  </>
+                );
+              })()}
+
+              {rangeTestStage === 'incomplete' && (
+                <>
+                  <p className="hint" style={{ marginTop: 0 }}>
+                    {rangeTestIncomplete === 'both'
+                      ? "We couldn't get a reliable reading. Let's try from the start."
+                      : `We found your ${rangeTestIncomplete === 'down' ? 'highest' : 'lowest'} note, but not the ${
+                          rangeTestIncomplete === 'down' ? 'lowest' : 'highest'
+                        } one.`}
+                  </p>
+                  <div className="transport" style={{ justifyContent: 'center' }}>
+                    {rangeTestIncomplete === 'both' ? (
+                      <button className="button" onClick={startVocalRangeTest}>Try again</button>
+                    ) : (
+                      <button className="button" onClick={() => retryRangeDirection(rangeTestIncomplete)}>
+                        Retry the {rangeTestIncomplete === 'down' ? 'low' : 'high'} notes
+                      </button>
+                    )}
+                    <button className="button is-secondary" onClick={closeRangeTestOverlay}>Close</button>
+                  </div>
+                </>
+              )}
+
+              {rangeTestStage === 'result' && rangeTestResult && (
+                <>
+                  <div className="range-test-indicator is-your-turn">
+                    {formatNote(rangeTestResult.lowestMidi, useSolfege)}–{formatNote(rangeTestResult.highestMidi, useSolfege)}
+                  </div>
+                  <p className="hint">
+                    A span of {rangeTestResult.spanOctaves.toFixed(1)} octaves · closest to {rangeTestResult.voiceType.name}
+                  </p>
+                  <div className="transport" style={{ justifyContent: 'center' }}>
+                    <button
+                      className="button"
+                      onClick={() => {
+                        applyMeasuredRange(rangeTestResult.lowestMidi, rangeTestResult.highestMidi);
+                        closeRangeTestOverlay();
+                      }}
+                    >
+                      Use this range
+                    </button>
+                    <button className="button is-secondary" onClick={closeRangeTestOverlay}>Close</button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
