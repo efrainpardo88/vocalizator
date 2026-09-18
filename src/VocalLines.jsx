@@ -8,6 +8,7 @@ import {
   TRAVEL_DIRECTIONS,
   VOICE_TYPES,
   countBeats,
+  highestUsableRoot,
   toSteps,
 } from './patterns.js';
 
@@ -185,11 +186,18 @@ export default function VocalLines() {
 
   /* ------------------------------- roots -------------------------------- */
   const roots = useMemo(() => {
-    const ceiling = limitByTopNote ? highestNote - highestOffset : highestNote;
+    const ceiling = limitByTopNote ? highestUsableRoot(pattern, highestNote) : highestNote;
 
     const ascending = [];
     for (let root = lowestRoot; root <= ceiling; root += stepSize) ascending.push(root);
-    if (ascending.length === 0) ascending.push(lowestRoot);
+
+    /*
+     * No root fits: the pattern reaches higher than the range allows from
+     * any starting note. This used to fall back to the lowest root, which
+     * quietly asked the singer for notes above the ceiling they had just
+     * declared. Returning nothing lets the interface say so instead.
+     */
+    if (ascending.length === 0) return [];
 
     let ordered = ascending;
     if (direction === 'down') {
@@ -206,7 +214,7 @@ export default function VocalLines() {
       for (let time = 0; time < repeatsPerRoot; time += 1) repeated.push(root);
     });
     return repeated;
-  }, [lowestRoot, highestNote, stepSize, direction, limitByTopNote, highestOffset, repeatsPerRoot]);
+  }, [lowestRoot, highestNote, stepSize, direction, limitByTopNote, pattern, repeatsPerRoot]);
 
   const beatDuration = 60 / tempo / notesPerBeat;
 
@@ -262,6 +270,10 @@ export default function VocalLines() {
   }, []);
 
   const play = useCallback(async () => {
+    // Nothing fits the range, so there is nothing to schedule. Guarded here
+    // as well as in the interface, since play() is the only thing that sounds.
+    if (roots.length === 0) return;
+
     setAudioSession(microphoneOn ? 'play-and-record' : 'playback');
     await Tone.start(); // Browsers only allow audio after a user gesture.
 
@@ -744,7 +756,10 @@ export default function VocalLines() {
   };
 
   /* ------------------------------ derived UI ----------------------------- */
-  const activeRoot = cursor ? cursor.root : roots[0];
+  const fitsRange = roots.length > 0;
+  // Falls back to the lowest root purely so the contour and keyboard still
+  // draw something. Playback is blocked separately; this is never sounded.
+  const activeRoot = cursor ? cursor.root : (roots[0] ?? lowestRoot);
   const activeNotes = steps.map((step) => activeRoot + step.degree);
   const offsetSpan = highestOffset - lowestOffset || 1;
 
@@ -843,8 +858,17 @@ export default function VocalLines() {
             <div className="meta-row"><span>Length</span><b>{formatDuration(sessionLength)}</b></div>
             <div className="meta-row"><span>Suggested syllable</span><b>{pattern.syllable}</b></div>
 
+            {!fitsRange && (
+              <p className="error">
+                This pattern reaches {formatNote(lowestRoot + highestOffset, useSolfege)} from your
+                lowest note, above your ceiling of {formatNote(highestNote, useSolfege)}. Raise the
+                top of your range, or clear &ldquo;Stop at the pattern&rsquo;s highest note, not its
+                tonic&rdquo; to sing it anyway.
+              </p>
+            )}
+
             <div className="transport">
-              {playState === 'playing' ? (
+              {!fitsRange ? null : playState === 'playing' ? (
                 <button className="button" onClick={pause}>Pause</button>
               ) : playState === 'paused' ? (
                 <button className="button" onClick={resume}>Resume</button>
