@@ -19,6 +19,13 @@ export const frequencyToMidi = (frequency) => 69 + 12 * Math.log2(frequency / 44
 export const centsBetween = (sungMidi, targetMidi) => (sungMidi - targetMidi) * 100;
 
 /**
+ * How far a sung pitch may sit from a target and still count as "in tune".
+ * Shared by the practice tuner and the vocal range test's comfortable middle
+ * note, so the two mean the same thing when they both say "in tune".
+ */
+export const IN_TUNE_CENTS = 20;
+
+/**
  * Estimates the fundamental frequency of a time-domain buffer by
  * autocorrelation. Returns -1 when the signal is too quiet or too noisy to
  * call, which is the common case between notes.

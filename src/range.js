@@ -16,16 +16,36 @@
  * moment.
  */
 
-import { centsBetween, frequencyToMidi } from './pitch.js';
+import { IN_TUNE_CENTS, centsBetween, frequencyToMidi } from './pitch.js';
 import { VOICE_TYPES } from './patterns.js';
 
 /**
- * How far a sung pitch may sit from the target and still count as that
- * note, rather than a miss. Matches the tuner's in-tune threshold in
- * VocalLines.jsx (verified by reading `IN_TUNE_CENTS` there) so "in tune"
- * means the same thing during practice and during the range test.
+ * Outer bound on the walk itself, independent of whatever frequency range
+ * `detectPitch` happens to accept. Without this, the walk only terminates
+ * because that collaborator refuses anything outside 60-1400 Hz — a property
+ * of `pitch.js`, not a guarantee this module should lean on. Chosen wide
+ * enough to sit outside any voice this test will plausibly meet (roughly C0
+ * to C8); assumed, not verified against real singers, and only meant as a
+ * safety rail so the walk is self-terminating on its own terms.
  */
-export const IN_TUNE_CENTS_TOLERANCE = 20;
+export const MIN_TEST_MIDI = 12;
+export const MAX_TEST_MIDI = 108;
+
+/**
+ * How far a sung pitch may sit from the target and still count as "reached
+ * this note", for the purpose of deciding whether the walk should keep
+ * going. This is deliberately wider than `IN_TUNE_CENTS` (imported from
+ * `pitch.js`, used for the practice tuner and for judging the comfortable
+ * middle note): at the edges of a range a singer reaches a note without
+ * centering it, and holding the boundary to the same standard as "in tune"
+ * would report a range narrower than the singer's real one.
+ *
+ * 50 cents is a quarter of a semitone: forgiving of a note sung under or
+ * over pitch, while still closer to the target than to its neighbor. This
+ * is an assumed starting point, not a verified constant — it needs tuning
+ * against real voices once this ships.
+ */
+export const BOUNDARY_CENTS_TOLERANCE = 50;
 
 /**
  * Classifies one measurement window against the note it was asked to match.
@@ -42,21 +62,38 @@ export const IN_TUNE_CENTS_TOLERANCE = 20;
  * boundary information, not a failure to propagate, so any non-positive
  * frequency is treated as "nothing was sung usably" here, same as a pitch
  * that was audible but too far from the target to be that note.
+ *
+ * `usable` decides whether the walk continues past this note, judged
+ * against `BOUNDARY_CENTS_TOLERANCE`. `inTune` is the stricter, informational
+ * read against `IN_TUNE_CENTS` — the same standard the practice tuner uses —
+ * for an interface that wants to show precise tuning feedback without it
+ * affecting where the boundary is drawn.
  */
 export function evaluateAttempt(targetMidi, singerOnlyFrequency) {
   if (!(singerOnlyFrequency > 0)) {
-    return { targetMidi, midi: null, centsOff: null, usable: false };
+    return { targetMidi, midi: null, centsOff: null, usable: false, inTune: false };
   }
   const midi = frequencyToMidi(singerOnlyFrequency);
   const centsOff = centsBetween(midi, targetMidi);
-  return { targetMidi, midi, centsOff, usable: Math.abs(centsOff) <= IN_TUNE_CENTS_TOLERANCE };
+  return {
+    targetMidi,
+    midi,
+    centsOff,
+    usable: Math.abs(centsOff) <= BOUNDARY_CENTS_TOLERANCE,
+    inTune: Math.abs(centsOff) <= IN_TUNE_CENTS,
+  };
 }
 
-/** Starts a walk anchored on a comfortable middle note, given as a MIDI number. */
-export function startRangeTest(middleMidi) {
+/**
+ * Starts a walk anchored on a comfortable middle note, given as a MIDI
+ * number. `phase` defaults to 'down', the normal start of a fresh test; the
+ * interface layer may pass 'up' to retry only the direction that failed to
+ * resolve last time, without re-walking the side that already succeeded.
+ */
+export function startRangeTest(middleMidi, phase = 'down') {
   return {
     status: 'measuring',
-    phase: 'down',
+    phase,
     middleMidi,
     nextTargetMidi: middleMidi,
     consecutiveFailures: 0,
@@ -74,6 +111,11 @@ export function startRangeTest(middleMidi) {
  * `status: 'complete'` once both boundaries have been found (or given up
  * on). Calling this after the walk is complete is a caller error and is a
  * no-op, since there is no note left to have measured.
+ *
+ * A phase also ends the moment its next step would cross `MIN_TEST_MIDI` or
+ * `MAX_TEST_MIDI`, even on a single miss or a lone success right at the
+ * edge: there is nowhere further to try, so waiting for a second failure
+ * would only stall the walk against its own bound.
  */
 export function recordAttempt(state, singerOnlyFrequency) {
   if (state.status === 'complete') return state;
@@ -83,18 +125,26 @@ export function recordAttempt(state, singerOnlyFrequency) {
   const measurements = [...state.measurements, attempt];
 
   if (state.phase === 'down') {
+    const nextDown = targetMidi - 1;
+    const atFloor = nextDown < MIN_TEST_MIDI;
+
     if (attempt.usable) {
-      return {
-        ...state,
-        measurements,
-        lowestUsableMidi: targetMidi,
-        consecutiveFailures: 0,
-        nextTargetMidi: targetMidi - 1,
-      };
+      const lowestUsableMidi = targetMidi;
+      if (atFloor) {
+        return {
+          ...state,
+          measurements,
+          lowestUsableMidi,
+          phase: 'up',
+          consecutiveFailures: 0,
+          nextTargetMidi: state.middleMidi,
+        };
+      }
+      return { ...state, measurements, lowestUsableMidi, consecutiveFailures: 0, nextTargetMidi: nextDown };
     }
 
     const consecutiveFailures = state.consecutiveFailures + 1;
-    if (consecutiveFailures >= 2) {
+    if (consecutiveFailures >= 2 || atFloor) {
       // The bottom has been found. Return to the middle and walk up.
       return {
         ...state,
@@ -104,25 +154,26 @@ export function recordAttempt(state, singerOnlyFrequency) {
         nextTargetMidi: state.middleMidi,
       };
     }
-    return { ...state, measurements, consecutiveFailures, nextTargetMidi: targetMidi - 1 };
+    return { ...state, measurements, consecutiveFailures, nextTargetMidi: nextDown };
   }
 
   // phase === 'up'
+  const nextUp = targetMidi + 1;
+  const atCeiling = nextUp > MAX_TEST_MIDI;
+
   if (attempt.usable) {
-    return {
-      ...state,
-      measurements,
-      highestUsableMidi: targetMidi,
-      consecutiveFailures: 0,
-      nextTargetMidi: targetMidi + 1,
-    };
+    const highestUsableMidi = targetMidi;
+    if (atCeiling) {
+      return { ...state, measurements, highestUsableMidi, status: 'complete', consecutiveFailures: 0, nextTargetMidi: null };
+    }
+    return { ...state, measurements, highestUsableMidi, consecutiveFailures: 0, nextTargetMidi: nextUp };
   }
 
   const consecutiveFailures = state.consecutiveFailures + 1;
-  if (consecutiveFailures >= 2) {
+  if (consecutiveFailures >= 2 || atCeiling) {
     return { ...state, measurements, status: 'complete', consecutiveFailures, nextTargetMidi: null };
   }
-  return { ...state, measurements, consecutiveFailures, nextTargetMidi: targetMidi + 1 };
+  return { ...state, measurements, consecutiveFailures, nextTargetMidi: nextUp };
 }
 
 /**

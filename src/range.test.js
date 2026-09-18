@@ -2,7 +2,9 @@ import { describe, it, expect } from 'vitest';
 
 import { midiToFrequency } from './pitch.js';
 import {
-  IN_TUNE_CENTS_TOLERANCE,
+  BOUNDARY_CENTS_TOLERANCE,
+  MAX_TEST_MIDI,
+  MIN_TEST_MIDI,
   closestVoiceType,
   evaluateAttempt,
   finalizeRangeTest,
@@ -35,17 +37,25 @@ describe('evaluateAttempt', () => {
   });
 
   it('is unusable when the pitch is too far from the target to be that note', () => {
-    // A whole tone away is well outside the in-tune tolerance.
+    // A whole tone away is well outside the boundary tolerance.
     const attempt = evaluateAttempt(60, midiToFrequency(62));
     expect(attempt.usable).toBe(false);
   });
 
-  it('stays usable right at the edge of the tolerance', () => {
+  it('stays usable right at the edge of the boundary tolerance', () => {
     const centsFrequency = (midi, cents) => midiToFrequency(midi) * Math.pow(2, cents / 1200);
-    const justInside = evaluateAttempt(60, centsFrequency(60, IN_TUNE_CENTS_TOLERANCE - 1));
-    const justOutside = evaluateAttempt(60, centsFrequency(60, IN_TUNE_CENTS_TOLERANCE + 1));
+    const justInside = evaluateAttempt(60, centsFrequency(60, BOUNDARY_CENTS_TOLERANCE - 1));
+    const justOutside = evaluateAttempt(60, centsFrequency(60, BOUNDARY_CENTS_TOLERANCE + 1));
     expect(justInside.usable).toBe(true);
     expect(justOutside.usable).toBe(false);
+  });
+
+  it('is usable but not in tune between the in-tune and boundary tolerances', () => {
+    const centsFrequency = (midi, cents) => midiToFrequency(midi) * Math.pow(2, cents / 1200);
+    // 35 cents sits past IN_TUNE_CENTS (20) but inside BOUNDARY_CENTS_TOLERANCE (50).
+    const attempt = evaluateAttempt(60, centsFrequency(60, 35));
+    expect(attempt.usable).toBe(true);
+    expect(attempt.inTune).toBe(false);
   });
 });
 
@@ -134,6 +144,59 @@ describe('recordAttempt', () => {
 
     state = recordAttempt(state, midiToFrequency(MIDDLE_MIDI)); // middle succeeds this time
     expect(state.highestUsableMidi).toBe(MIDDLE_MIDI);
+  });
+});
+
+describe('self-terminating floor and ceiling', () => {
+  it('does not wait for a second miss at the floor - there is nowhere lower to try', () => {
+    let state = startRangeTest(MIN_TEST_MIDI);
+    state = recordAttempt(state, -1); // a single miss, right at the floor itself
+    expect(state.phase).toBe('up');
+    expect(state.consecutiveFailures).toBe(0);
+    expect(state.lowestUsableMidi).toBeNull();
+  });
+
+  it('stops going down at the floor even when every note is sung perfectly', () => {
+    let state = startRangeTest(MIN_TEST_MIDI + 1);
+    state = recordAttempt(state, midiToFrequency(MIN_TEST_MIDI + 1)); // succeeds, next target is the floor
+    expect(state.nextTargetMidi).toBe(MIN_TEST_MIDI);
+    state = recordAttempt(state, midiToFrequency(MIN_TEST_MIDI)); // succeeds at the floor itself
+    expect(state.lowestUsableMidi).toBe(MIN_TEST_MIDI);
+    expect(state.phase).toBe('up'); // moves on regardless of detectPitch's own limits
+    expect(state.nextTargetMidi).toBe(MIN_TEST_MIDI + 1);
+  });
+
+  it('does not wait for a second miss at the ceiling - there is nowhere higher to try', () => {
+    let state = startRangeTest(MAX_TEST_MIDI, 'up');
+    state = recordAttempt(state, -1); // a single miss, right at the ceiling itself
+    expect(state.status).toBe('complete');
+    expect(state.consecutiveFailures).toBe(1);
+    expect(state.highestUsableMidi).toBeNull();
+  });
+
+  it('stops going up at the ceiling even when every note is sung perfectly', () => {
+    let state = startRangeTest(MAX_TEST_MIDI - 1, 'up');
+    state = recordAttempt(state, midiToFrequency(MAX_TEST_MIDI - 1)); // succeeds, next target is the ceiling
+    expect(state.nextTargetMidi).toBe(MAX_TEST_MIDI);
+    state = recordAttempt(state, midiToFrequency(MAX_TEST_MIDI)); // succeeds at the ceiling itself
+    expect(state.status).toBe('complete'); // completes on its own, not because detectPitch refused a frequency
+    expect(state.highestUsableMidi).toBe(MAX_TEST_MIDI);
+  });
+});
+
+describe('startRangeTest with a starting phase', () => {
+  it('walks only up when started in the up phase, for retrying a failed direction', () => {
+    const singFrequencyFor = (midi) => (midi <= MIDDLE_MIDI + 3 ? midiToFrequency(midi) : -1);
+    let state = startRangeTest(MIDDLE_MIDI, 'up');
+    expect(state.phase).toBe('up');
+    expect(state.lowestUsableMidi).toBeNull();
+
+    while (state.status !== 'complete') {
+      state = recordAttempt(state, singFrequencyFor(state.nextTargetMidi));
+    }
+
+    expect(state.highestUsableMidi).toBe(MIDDLE_MIDI + 3);
+    expect(state.lowestUsableMidi).toBeNull(); // the down side was never walked
   });
 });
 
