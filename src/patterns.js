@@ -84,6 +84,19 @@ export const PATTERN_LIBRARY = [
   { id: 'chromatic-fifth', category: 'Chromatic', name: 'Chromatic up to the fifth', degrees: [0, 1, 2, 3, 4, 5, 6, 7, 6, 5, 4, 3, 2, 1, 0], syllable: 'mee' },
   { id: 'chromatic-octave', category: 'Chromatic', name: 'Chromatic octave, ascending', degrees: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], syllable: 'ah' },
 
+  // Classic vocalises
+  /*
+   * The most familiar exercise in vocal pedagogy, attributed to Rossini by
+   * Heinrich Panofka in L'Art de Chanter (1853). Thirteen notes reaching a
+   * twelfth above the tonic — the "octave and a half" it is usually called.
+   * It climbs the tonic arpeggio and comes back down by steps and thirds, so
+   * the descent is not the ascent reversed.
+   *
+   * Scale degrees 1 3 5 8 10 12 11 9 7 5 4 2 1 over the major scale, which is
+   * the sequence below in semitones.
+   */
+  { id: 'rossini-scale', category: 'Arpeggios', name: 'Rossini scale, an octave and a half', degrees: [0, 4, 7, 12, 16, 19, 17, 14, 11, 7, 5, 2, 0], syllable: 'ah, legato' },
+
   // Sustains
   { id: 'sustain-fifth', category: 'Sustains', name: '1-2-3-4-5 with the fifth held', degrees: [0, 2, 4, 5, 7, 5, 4, 2, 0], beats: [1, 1, 1, 1, 5, 1, 1, 1, 1], syllable: 'nay' },
   { id: 'sustain-fifth-long', category: 'Sustains', name: '1-2-3-4-5 with a long fifth', degrees: [0, 2, 4, 5, 7, 5, 4, 2, 0], beats: [1, 1, 1, 1, 8, 1, 1, 1, 2], syllable: 'ah' },
@@ -103,6 +116,18 @@ export const toSteps = (pattern) =>
     degree,
     beats: (pattern.beats && pattern.beats[index]) || 1,
   }));
+
+/**
+ * The highest root a pattern can be transposed to without its top note rising
+ * above `highestNote`.
+ *
+ * A pattern wider than the singer's range returns a root below their lowest,
+ * which is how "this exercise does not fit" is expressed: there is no root
+ * that works, not merely a lower one. The Rossini scale reaches nineteen
+ * semitones, so it does not fit every voice.
+ */
+export const highestUsableRoot = (pattern, highestNote) =>
+  highestNote - Math.max(...pattern.degrees);
 
 /** Total length of a pattern, counted in beats. */
 export const countBeats = (steps) => steps.reduce((total, step) => total + step.beats, 0);

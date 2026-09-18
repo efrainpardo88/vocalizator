@@ -7,6 +7,7 @@ import {
   TRAVEL_DIRECTIONS,
   VOICE_TYPES,
   countBeats,
+  highestUsableRoot,
   toSteps,
 } from './patterns.js';
 
@@ -147,5 +148,62 @@ describe('option lists', () => {
       const ids = list.map((item) => item.id);
       expect(new Set(ids).size).toBe(ids.length);
     });
+  });
+});
+
+describe('the Rossini scale', () => {
+  const rossini = PATTERN_LIBRARY.find((pattern) => pattern.id === 'rossini-scale');
+
+  /*
+   * Scale degrees 1 3 5 8 10 12 11 9 7 5 4 2 1 over the major scale, given by
+   * the singer this was added for. Pinned here because a wrong semitone is
+   * inaudible in a diff and obvious in the ear.
+   */
+  it('is the thirteen notes of the exercise, in semitones', () => {
+    expect(rossini.degrees).toEqual([0, 4, 7, 12, 16, 19, 17, 14, 11, 7, 5, 2, 0]);
+  });
+
+  it('climbs the tonic arpeggio and comes back down another way', () => {
+    const ascent = rossini.degrees.slice(0, 6);
+    const descent = rossini.degrees.slice(5);
+    expect(ascent).toEqual([0, 4, 7, 12, 16, 19]);
+    expect(descent).not.toEqual([...ascent].reverse());
+  });
+
+  it('reaches a twelfth above the tonic, the octave and a half it is named for', () => {
+    expect(Math.max(...rossini.degrees)).toBe(19);
+  });
+
+  it('never dips below its tonic', () => {
+    expect(Math.min(...rossini.degrees)).toBe(0);
+  });
+});
+
+describe('highestUsableRoot', () => {
+  const reachingAnOctave = { degrees: [0, 12, 0] };
+
+  it('leaves room for the top note of the pattern', () => {
+    expect(highestUsableRoot(reachingAnOctave, 72)).toBe(60);
+  });
+
+  it('is the ceiling itself for a pattern that never leaves its tonic', () => {
+    expect(highestUsableRoot({ degrees: [0, 0, 0] }, 72)).toBe(72);
+  });
+
+  /*
+   * The case the Rossini scale exposed: a pattern wider than the singer's
+   * range yields a root below their lowest, which is how "this does not fit
+   * anywhere" is expressed rather than an out-of-range exercise.
+   */
+  it('falls below the lowest root when the pattern is wider than the range', () => {
+    const bass = VOICE_TYPES.find((voice) => voice.id === 'bass');
+    const rossini = PATTERN_LIBRARY.find((pattern) => pattern.id === 'rossini-scale');
+    expect(highestUsableRoot(rossini, bass.highest)).toBeLessThan(bass.lowest);
+  });
+
+  it('leaves a tenor exactly one root for the Rossini scale', () => {
+    const tenor = VOICE_TYPES.find((voice) => voice.id === 'tenor');
+    const rossini = PATTERN_LIBRARY.find((pattern) => pattern.id === 'rossini-scale');
+    expect(highestUsableRoot(rossini, tenor.highest)).toBe(tenor.lowest);
   });
 });
