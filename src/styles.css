@@ -349,7 +349,15 @@ input[type='checkbox'] {
   background: #c88b2f;
 }
 
-.key.is-sounding {
+/*
+ * Both selectors below paint the sounding note mint. The second exists
+ * because a black key inside the selected range carries .is-selected.is-black
+ * as well, and that pair of classes outweighs .is-sounding on its own — so
+ * the sounding note on a black key kept its amber and never lit at all.
+ * Matching the specificity, later in the file, lets sounding win.
+ */
+.key.is-sounding,
+.key.is-sounding.is-black {
   background: var(--mint);
 }
 
